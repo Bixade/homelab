@@ -50,3 +50,22 @@ services:
       - homepage.icon=qbittorrent.png
       - homepage.href=http://mediaserver:8080
     restart: unless-stopped
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    network_mode: "service:gluetun"   # searches go out through the VPN
+    depends_on:
+      - gluetun
+    environment:
+      - SEARXNG_PORT=8888
+      - SEARXNG_BASE_URL=http://mediaserver:8888/
+      - SEARXNG_SECRET=${SEARXNG_SECRET}
+    volumes:
+      - /appdata/searxng:/etc/searxng
+    labels:
+      - homepage.group=Tools
+      - homepage.name=SearXNG
+      - homepage.icon=searxng.png
+      - homepage.href=http://mediaserver:8888
+      - homepage.description=Private search
+    restart: unless-stopped
