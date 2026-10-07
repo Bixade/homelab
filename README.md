@@ -1,6 +1,6 @@
 # Homelab
 
-Self-hosted media server, monitoring stack and personal cloud, running on OpenMediaVault with Docker Compose. Everything is reachable privately over Tailscale; nothing is exposed to the public internet.
+Self-hosted media server, monitoring stack and personal cloud, running on OpenMediaVault with Docker Compose. Everything is reachable privately over Tailscale. Only Jellyfin, Seerr and Immich are also published, through a small VPS reverse proxy that can reach nothing else on the network (see Networking and access).
 
 ## Architecture
 
@@ -25,9 +25,17 @@ flowchart LR
         subgraph Monitoring
             Mon[Uptime Kuma · Beszel<br/>Scrutiny · SmokePing<br/>Speedtest Tracker]
         end
+        subgraph Personal[Personal cloud]
+            Cloud[Immich · Vaultwarden<br/>Kavita · Bookkeeprr]
+            Kopia[Kopia<br/>nightly snapshot]
+        end
         Proxy[Docker socket proxy<br/>read-only]
         Homepage --> Proxy
     end
+
+    Public[Family and friends<br/>browsers, TVs] -->|HTTPS| VPS[VPS · Caddy<br/>tag:vps]
+    VPS -->|Tailscale ACL:<br/>3 ports only| Server
+    Kopia -->|SFTP| Box[(Hetzner<br/>Storage Box)]
 
     VPN -->|WireGuard, kill switch| Internet((Internet))
     Server --> NVMe[(1TB NVMe<br/>OS · containers · app data)]
@@ -54,6 +62,11 @@ flowchart LR
 | Media | Seerr | Browse and request titles; users log in with their Jellyfin accounts | 5055 |
 | Media | Maintainerr | Rule-based library cleanup | 6246 |
 | Downloads | qBittorrent | Download client, routed through Gluetun | 8080 |
+| Photos | Immich | Photos and videos, phone upload; originals on the NVMe, ML off for now | 2283 |
+| Passwords | Vaultwarden | Bitwarden-compatible password manager, Tailscale-only | 8222 (Tailscale Serve) |
+| Books | Kavita | Manga and book reader | 5000 |
+| Books | Bookkeeprr | Library manager and reader for manga and books | 8484 |
+| Backup | Kopia | Encrypted off-site snapshots of `/appdata` to a Hetzner Storage Box | 51515 |
 | Privacy | Gluetun | Proton VPN (WireGuard) with port forwarding and a kill switch | — |
 | Privacy | SearXNG | Private meta search engine, routed through Gluetun | 8888 |
 | Monitoring | Uptime Kuma | Service uptime checks | 3001 |
@@ -89,6 +102,8 @@ HDD (/srv/mergerfs/data, mergerfs pool)
 - **Tailscale** for all access: the server sits behind Odido 5G with **CGNAT**, so there are no open ports. Clients connect over WireGuard, directly where possible.
 - **Exit node:** the server can act as a personal VPN on public Wi-Fi, opt-in per device.
 - **Gluetun:** qBittorrent and SearXNG share Gluetun's network namespace, so all their traffic leaves through Proton VPN. If the VPN drops, they have no network at all (verified). `FIREWALL_OUTBOUND_SUBNETS` keeps replies to the LAN, Docker and Tailscale off the tunnel.
+- **Public access through a VPS:** friends and family without Tailscale reach Jellyfin, Seerr and Immich through a small VPS running Caddy (automatic HTTPS). The VPS joins the tailnet as `tag:vps`, and the ACL lets it reach only the server on ports 8096, 5055 and 2283. The home server only makes outbound connections, so CGNAT is no problem. Vaultwarden, the admin UIs and everything else stay tailnet-only. On the public Immich name the admin paths are blocked, and fail2ban watches the Jellyfin and Immich logins.
+- **Remote bitrate caps** in Jellyfin: 20 Mbps for the owner, 8 Mbps for family, 4 Mbps for everyone else, chosen from 14 days of speed-test history.
 - **Fixed IP** through a DHCP reservation on the router rather than a static IP in the OS, so moving house only needs a new reservation.
 
 ## Security
@@ -97,7 +112,9 @@ HDD (/srv/mergerfs/data, mergerfs pool)
 - **gitleaks** runs as a pre-commit hook, and GitHub push protection is enabled.
 - **Docker socket access goes through a read-only proxy** (`docker-socket-proxy`, `POST=0`). Direct socket access is effectively root on the host, even with `:ro`.
 - **Least privilege:** containers run as a non-root user (`PUID=1000`, `PGID=100`) where possible; media is read-only for Jellyfin.
-- **SSH** with keys only; no service is published to the internet.
+- **SSH** with keys only, on the server and the VPS.
+- **Public exposure is limited to three services** behind the VPS, and the ACL stops the VPS from reaching anything else. No sign-ups on Immich or Vaultwarden, long generated passwords, TOTP on Vaultwarden.
+- **Backups:** Kopia encrypts snapshots client-side before they leave for the Storage Box. SQLite apps are dumped nightly with `.backup`, and live database files are excluded so snapshots stay consistent. Restores of Vaultwarden and Immich have been tested.
 
 ## Incidents and lessons learned
 
@@ -109,11 +126,24 @@ HDD (/srv/mergerfs/data, mergerfs pool)
 
 **Browser transcoding.** Browsers transcode MKV, Opus/5.1 audio and styled subtitles. One file used HEVC 4:4:4 10-bit, which the iGPU can't decode, so it fell back to the CPU. Native clients (Jellyfin Media Player, Infuse) direct-play these instead.
 
+## Backups
+
+| Time | Job |
+|---|---|
+| 02:00 | Immich database dump |
+| 02:20 | Bookkeeprr SQLite dump |
+| 02:25 | Kavita SQLite dump |
+| 02:30 | Vaultwarden SQLite dump |
+| 03:00 | Kopia snapshot of `/appdata` to the Storage Box |
+
+Regenerable data (Jellyfin cache and metadata, Immich thumbnails and encoded video, the Immich Postgres folder, live SQLite files) is excluded through `/appdata/.kopiaignore`. Parents' phone galleries are not backed up: they add only chosen photos to a shared Immich album.
+
 ## Conventions
 
 - One folder per stack, managed by the OMV compose plugin; container data in `appdata` via `CHANGE_TO_COMPOSE_DATA_PATH`.
 - Every service gets Homepage labels and an Uptime Kuma monitor.
 - Containers in different stacks reach each other through the host IP, not container names.
+- Pin versions of apps that hold data (Immich, Bookkeeprr) and update deliberately after reading the release notes.
 - Stacks that share Gluetun are always restarted together (**Down → Up**), never Gluetun alone.
 
 ## Adding a new service
@@ -135,7 +165,9 @@ HDD (/srv/mergerfs/data, mergerfs pool)
 ## Roadmap
 
 - SnapRAID parity drive (8TB) and a second RAM stick
-- Off-site backups (Kopia/restic → Hetzner Storage Box) with tested restores
-- Personal cloud: Immich (photos), Vaultwarden (passwords), Nextcloud (files)
+- ~~Off-site backups (Kopia → Hetzner Storage Box) with tested restores~~ done
+- ~~Immich and Vaultwarden~~ done; Nextcloud (files) still open
+- Immich machine learning on the laptop GPU, after the family uploads
+- Mail watcher that saves attachments and sends notifications (written, not deployed yet)
 - Self-built network monitor with automatic latency-spike diagnosis
-- Infrastructure as code: Ansible for the server, Terraform for a public VPS reverse proxy
+- Infrastructure as code: Ansible for the server, Terraform for the VPS reverse proxy
