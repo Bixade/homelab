@@ -1,6 +1,6 @@
 # Homelab
 
-Self-hosted media server, monitoring stack and personal cloud, running on OpenMediaVault with Docker Compose. Everything is reachable privately over Tailscale. Only Jellyfin, Seerr and Immich are also published, through a small VPS reverse proxy that can reach nothing else on the network (see Networking and access).
+Self-hosted media server, monitoring stack, personal cloud and network-wide ad blocking, running on OpenMediaVault with Docker Compose. Everything is reachable privately over Tailscale. Only Jellyfin, Seerr and Immich are also published, through a small VPS reverse proxy that can reach nothing else on the network (see Networking and access).
 
 ## Architecture
 
@@ -26,8 +26,12 @@ flowchart LR
             Mon[Uptime Kuma · Beszel<br/>Scrutiny · SmokePing<br/>Speedtest Tracker]
         end
         subgraph Personal[Personal cloud]
-            Cloud[Immich · Vaultwarden<br/>Kavita · Bookkeeprr]
+            Cloud[Immich · Vaultwarden · Nextcloud<br/>Kavita · Bookkeeprr · Navidrome<br/>Wallos]
             Kopia[Kopia<br/>nightly snapshot]
+        end
+        subgraph Tools[Network and tools]
+            Net[AdGuard Home<br/>UpSnap]
+            Dev[code-server]
         end
         Proxy[Docker socket proxy<br/>read-only]
         Homepage --> Proxy
@@ -66,6 +70,12 @@ flowchart LR
 | Passwords | Vaultwarden | Bitwarden-compatible password manager, Tailscale-only | 8222 (Tailscale Serve) |
 | Books | Kavita | Manga and book reader | 5000 |
 | Books | Bookkeeprr | Library manager and reader for manga and books | 8484 |
+| Music | Navidrome | Music server with Subsonic apps; library not filled yet | 4533 (+ Tailscale Serve) |
+| Files | Nextcloud | Files, sharing links, calendar and contacts; PostgreSQL + Redis, Tailscale-only | 8383 (Tailscale Serve) |
+| Finance | Wallos | Subscription tracker with renewal dates and monthly cost | 8282 |
+| Development | code-server | VS Code in the browser (Python, Node, Java, C toolchains); no Docker access | 8384 (Tailscale Serve) |
+| Network | AdGuard Home | DNS ad and tracker blocking for the whole network, Quad9 over DoH upstream | 53 (DNS), 8098 (UI) |
+| Network | UpSnap | Wake-on-LAN for the desktop PC; remote desktop through RustDesk over Tailscale | 8095 |
 | Backup | Kopia | Encrypted off-site snapshots of `/appdata` to a Hetzner Storage Box | 51515 |
 | Privacy | Gluetun | Proton VPN (WireGuard) with port forwarding and a kill switch | — |
 | Privacy | SearXNG | Private meta search engine, routed through Gluetun | 8888 |
@@ -103,6 +113,9 @@ HDD (/srv/mergerfs/data, mergerfs pool)
 - **Exit node:** the server can act as a personal VPN on public Wi-Fi, opt-in per device.
 - **Gluetun:** qBittorrent and SearXNG share Gluetun's network namespace, so all their traffic leaves through Proton VPN. If the VPN drops, they have no network at all (verified). `FIREWALL_OUTBOUND_SUBNETS` keeps replies to the LAN, Docker and Tailscale off the tunnel.
 - **Public access through a VPS:** friends and family without Tailscale reach Jellyfin, Seerr and Immich through a small VPS running Caddy (automatic HTTPS). The VPS joins the tailnet as `tag:vps`, and the ACL lets it reach only the server on ports 8096, 5055 and 2283. The home server only makes outbound connections, so CGNAT is no problem. Vaultwarden, the admin UIs and everything else stay tailnet-only. On the public Immich name the admin paths are blocked, and fail2ban watches the Jellyfin and Immich logins.
+- **DNS ad blocking:** AdGuard Home answers for the whole house, because the router hands out the server as DNS and a public resolver as the second entry, so the network keeps working if the server is down. The server itself keeps using the router for DNS. Tailscale's global nameserver points at AdGuard too, so phones and laptops are filtered anywhere while Tailscale is connected (and have no filtering when it is off).
+- **Remote desktop and wake-up:** the desktop PC sleeps until UpSnap sends a wake-on-LAN packet from the server; RustDesk over Tailscale then provides the screen (Windows Home has no built-in remote desktop host).
+- **Private HTTPS:** Tailscale Serve gives Vaultwarden, Immich and Nextcloud their own HTTPS ports; code-server and Navidrome use TLS-terminated TCP ports because the three HTTPS ports Serve allows were already taken.
 - **Remote bitrate caps** in Jellyfin: 20 Mbps for the owner, 8 Mbps for family, 4 Mbps for everyone else, chosen from 14 days of speed-test history.
 - **Fixed IP** through a DHCP reservation on the router rather than a static IP in the OS, so moving house only needs a new reservation.
 
@@ -111,7 +124,7 @@ HDD (/srv/mergerfs/data, mergerfs pool)
 - **Secrets never go in Git.** They live in each stack's `.env` file (ignored); `.env.example` files show which variables are needed.
 - **gitleaks** runs as a pre-commit hook, and GitHub push protection is enabled.
 - **Docker socket access goes through a read-only proxy** (`docker-socket-proxy`, `POST=0`). Direct socket access is effectively root on the host, even with `:ro`.
-- **Least privilege:** containers run as a non-root user (`PUID=1000`, `PGID=100`) where possible; media is read-only for Jellyfin.
+- **Least privilege:** containers run as a non-root user (`PUID=1000`, `PGID=100`) where possible; media is read-only for Jellyfin and Navidrome; the browser IDE has no Docker socket, since that would be root on the host.
 - **SSH** with keys only, on the server and the VPS.
 - **Public exposure is limited to three services** behind the VPS, and the ACL stops the VPS from reaching anything else. No sign-ups on Immich or Vaultwarden, long generated passwords, TOTP on Vaultwarden.
 - **Backups:** Kopia encrypts snapshots client-side before they leave for the Storage Box. SQLite apps are dumped nightly with `.backup`, and live database files are excluded so snapshots stay consistent. Restores of Vaultwarden and Immich have been tested.
@@ -126,17 +139,28 @@ HDD (/srv/mergerfs/data, mergerfs pool)
 
 **Browser transcoding.** Browsers transcode MKV, Opus/5.1 audio and styled subtitles. One file used HEVC 4:4:4 10-bit, which the iGPU can't decode, so it fell back to the CPU. Native clients (Jellyfin Media Player, Infuse) direct-play these instead.
 
+**Nextcloud installed on SQLite.** The compose environment box was empty, so the database password and admin variables were blank: Postgres refused to initialise and Nextcloud's installer fell back to SQLite. Filling the variables, wiping the half-initialised data folders and restarting gave a clean PostgreSQL install, confirmed with `occ`.
+
+**Port 53 already in use.** AdGuard could not bind DNS because `systemd-resolved` already listens on the loopback addresses. Publishing port 53 only on the server's LAN and Tailscale addresses avoids the clash.
+
+**Wake-on-LAN that never woke the PC.** A packet capture showed a correct magic packet, but the MAC address entered was the Wi-Fi adapter's, not the Ethernet one the PC sleeps on. Using the right adapter fixed it. Windows also blocks ping by default, so UpSnap showed the PC offline until an ICMP rule was allowed.
+
+**Container could not write its database.** Navidrome crash-looped with "unable to open database file" because Docker had created its data folder as root before the ownership step ran. Creating and `chown`-ing the folder first is now the first step for every new stack.
+
 ## Backups
 
 | Time | Job |
 |---|---|
 | 02:00 | Immich database dump |
+| 02:15 | Nextcloud PostgreSQL dump |
 | 02:20 | Bookkeeprr SQLite dump |
 | 02:25 | Kavita SQLite dump |
 | 02:30 | Vaultwarden SQLite dump |
+| 02:35 | Wallos SQLite dump |
+| 02:40 | Navidrome SQLite dump |
 | 03:00 | Kopia snapshot of `/appdata` to the Storage Box |
 
-Regenerable data (Jellyfin cache and metadata, Immich thumbnails and encoded video, the Immich Postgres folder, live SQLite files) is excluded through `/appdata/.kopiaignore`. Parents' phone galleries are not backed up: they add only chosen photos to a shared Immich album.
+Regenerable data (Jellyfin cache and metadata, Immich thumbnails and encoded video, the Immich and Nextcloud Postgres folders, Nextcloud previews, AdGuard's query log, build caches such as `node_modules`, live SQLite files) is excluded through `/appdata/.kopiaignore`. Parents' phone galleries are not backed up: they add only chosen photos to a shared Immich album.
 
 ## Conventions
 
@@ -145,13 +169,15 @@ Regenerable data (Jellyfin cache and metadata, Immich thumbnails and encoded vid
 - Containers in different stacks reach each other through the host IP, not container names.
 - Pin versions of apps that hold data (Immich, Bookkeeprr) and update deliberately after reading the release notes.
 - Stacks that share Gluetun are always restarted together (**Down → Up**), never Gluetun alone.
+- Create the app folder and set its owner (`1000:100`) **before** the first start, otherwise Docker creates it as root.
+- The OMV compose plugin writes extra files next to `compose.yml` (`compose.override.yml` and a rendered `<name>.yml`). They can contain environment values, so they are git-ignored; only `compose.yml` and `.env.example` are committed.
 
 ## Adding a new service
 
 1. Create the compose file in OMV (Services → Compose → Files).
 2. Put secrets in the env box, never in the YAML, and add a `.env.example`.
 3. Add Homepage labels and an Uptime Kuma monitor.
-4. Include its data in backups if it stores anything important.
+4. Include its data in backups if it stores anything important; databases get a dump job before the 03:00 snapshot and their live files go in `.kopiaignore`.
 5. `git pull --rebase` → `git status` (no `.env` files) → `git add .` → `git commit` → `git push`.
 
 ## Rebuilding from scratch
@@ -166,7 +192,10 @@ Regenerable data (Jellyfin cache and metadata, Immich thumbnails and encoded vid
 
 - SnapRAID parity drive (8TB) and a second RAM stick
 - ~~Off-site backups (Kopia → Hetzner Storage Box) with tested restores~~ done
-- ~~Immich and Vaultwarden~~ done; Nextcloud (files) still open
+- ~~Immich, Vaultwarden and Nextcloud~~ done
+- ~~Network-wide ad blocking, remote wake-up and browser IDE~~ done
+- Fill the music library and test Navidrome on the phone
+- Restore test of the Nextcloud dump, and monitors for the newest services
 - Immich machine learning on the laptop GPU, after the family uploads
 - Mail watcher that saves attachments and sends notifications (written, not deployed yet)
 - Self-built network monitor with automatic latency-spike diagnosis
